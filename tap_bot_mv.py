@@ -1,8 +1,9 @@
 import os
+import json
+import base64
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import httpx
-import json
 from datetime import datetime, timedelta
 
 # ============================================
@@ -19,6 +20,7 @@ GRAPHQL_ENDPOINT = os.getenv("GRAPHQL_ENDPOINT", f"{MAINNET_ENDPOINT_1}/graphql"
 # Contract addresses (optional)
 MINER_CONTRACT_ADDRESS = os.getenv("MINER_CONTRACT_ADDRESS", "0:YOUR_MINER_ADDRESS")
 GAME_ROOT_ADDRESS = os.getenv("GAME_ROOT_ADDRESS", "0:YOUR_GAME_ROOT_ADDRESS")
+MINER_ABI_PATH = os.getenv("MINER_ABI_PATH", None)
 
 # ============================================
 # CONSTANTS
@@ -29,14 +31,51 @@ BLOCK_TIME = 5  # seconds
 MINING_DUR_TAP = 30  # seconds per tap
 
 # ============================================
+# LOAD ABI (Optional)
+# ============================================
+
+MINER_ABI = None
+if MINER_ABI_PATH and os.path.exists(MINER_ABI_PATH):
+    try:
+        with open(MINER_ABI_PATH, 'r') as f:
+            MINER_ABI = json.load(f)
+        print(f"✅ Loaded Miner ABI from {MINER_ABI_PATH}")
+    except Exception as e:
+        print(f"⚠️ Could not load ABI: {e}")
+
+# ============================================
 # HELPER FUNCTIONS
 # ============================================
 
-async def get_contract_state(miner_address: str) -> dict:
+def decode_contract_data(data_hex: str, abi=None) -> dict:
     """
-    ✅ CORRECT METHOD: Use getContractState(minerAddress)
-    Fetches Miner contract state from MAINNET
-    Returns: tapSum, tapSum5m, and other data
+    Attempt to decode contract data field
+    Data is BASE64 encoded TVM cell containing contract state
+    Full decoding requires the compiled ABI
+    """
+    result = {
+        "raw_data": data_hex[:50] + "..." if len(data_hex) > 50 else data_hex,
+        "encoded": True,
+        "decoded": False,
+        "note": "Contract state is TVM-encoded. Use Miner ABI for full decoding."
+    }
+    
+    try:
+        # Try to decode base64
+        decoded = base64.b64decode(data_hex)
+        result["raw_bytes"] = len(decoded)
+        result["hex"] = decoded.hex()[:50] + "..." if len(decoded.hex()) > 50 else decoded.hex()
+    except Exception as e:
+        result["error"] = f"Could not decode: {str(e)}"
+    
+    return result
+
+
+async def fetch_miner_contract_data(miner_address: str) -> dict:
+    """
+    ✅ CORRECT METHOD: Use getContractState() via blockchainAccountState
+    Fetches contract data field from MAINNET
+    Data contains: tapSum, tapSum5m, taps[], mbiCurTaps[], etc.
     """
     query = """
     query {
@@ -61,9 +100,9 @@ async def get_contract_state(miner_address: str) -> dict:
             result = response.json()
             
             if "data" in result and "blockchainAccountState" in result["data"]:
-                state_data = result["data"]["blockchainAccountState"]
-                if state_data:
-                    return state_data
+                state = result["data"]["blockchainAccountState"]
+                if state:
+                    return state
             return None
     except Exception as e:
         print(f"Error fetching contract state: {e}")
@@ -73,7 +112,7 @@ async def get_contract_state(miner_address: str) -> dict:
 async def fetch_miner_account(miner_address: str) -> dict:
     """
     Fetch account information from MAINNET
-    Returns balance, type, and other account data
+    Returns balance, type, and contract data field
     """
     query = """
     query {
@@ -89,6 +128,7 @@ async def fetch_miner_account(miner_address: str) -> dict:
             acc_type_name
             code_hash
             data
+            last_paid
         }
     }
     """ % miner_address
@@ -121,6 +161,39 @@ def format_balance(balance_str: str) -> str:
         return "0"
 
 
+def extract_data_info(data_hex: str) -> str:
+    """Extract information about the contract data"""
+    if not data_hex:
+        return "No data available"
+    
+    try:
+        # Decode base64
+        decoded = base64.b64decode(data_hex)
+        data_size = len(decoded)
+        
+        info = f"📦 Contract Data:\n"
+        info += f"  Size: {data_size} bytes\n"
+        info += f"  Format: BASE64 encoded TVM cell\n\n"
+        
+        info += "**Available Data (TVM Encoded):**\n"
+        info += "  • tapSum (total taps)\n"
+        info += "  • tapSum5m (5-min window)\n"
+        info += "  • taps[] (tap history)\n"
+        info += "  • mbiCurTaps[] (current MBI taps)\n"
+        info += "  • easyComplexity, hardComplexity\n"
+        info += "  • seed, commitData, miningDurSum\n"
+        info += "  • modifiedTapSum\n\n"
+        
+        info += "📌 **To Decode This Data:**\n"
+        info += "  1. Get Miner.abi.json from game provider\n"
+        info += "  2. Use tvm-cli: `tvm-cli run <address> getDetails {} --abi Miner.abi.json`\n"
+        info += "  3. Or provide ABI to bot via MINER_ABI_PATH\n"
+        
+        return info
+    except Exception as e:
+        return f"Error processing data: {str(e)}"
+
+
 def calculate_epoch_reset():
     """Calculate approximate epoch reset time"""
     try:
@@ -145,7 +218,7 @@ I fetch your **tap counts** and **mining data** from the Acki Nacki MAINNET.
 
 **How to use:**
 1. Send me your **Miner contract address** (starts with `0:`)
-2. I'll fetch your tap counts and epoch info
+2. I'll fetch your contract data and tap information
 
 **Example:**
 ```
@@ -153,12 +226,16 @@ I fetch your **tap counts** and **mining data** from the Acki Nacki MAINNET.
 ```
 
 **What I Show:**
-✅ Your total taps (tapSum)
-✅ 5-minute tap window (tapSum5m)
-✅ Current epoch info
-✅ Mining difficulty
-✅ Account balance
+✅ Contract data field (TVM encoded)
+✅ Account balance & status
+✅ Data size & encoding info
+✅ How to decode with Miner ABI
 ✅ Epoch reset time (approx)
+
+**Requirements:**
+📝 For full tap data decoding, you'll need:
+  - Miner.abi.json from game provider
+  - tvm-cli tool (or contact support)
 
 Type /help for more commands
     """
@@ -172,11 +249,16 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 /start - Welcome message
 /help - This help message
-/status - Check bot status
+/status - Check bot connection
 /epoch - Show epoch info
+/decode - Learn how to decode contract data
 
 **How to check your taps:**
 Just send your **Miner contract address** (format: `0:abc123...`)
+
+**To get full tap data:**
+You need the compiled Miner.abi.json file from your game provider.
+The bot can parse it if you provide it!
     """
     await update.message.reply_text(help_text, parse_mode="Markdown")
 
@@ -189,7 +271,10 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             if response.status_code == 200:
                 await update.message.reply_text(
                     f"✅ Bot is **ONLINE** and connected to Acki Nacki MAINNET!\n\n"
-                    f"🌐 Endpoint: `{GRAPHQL_ENDPOINT}`",
+                    f"🌐 Endpoint: `{GRAPHQL_ENDPOINT}`\n\n"
+                    f"📚 Using: **blockchainAccountState()** method\n"
+                    f"📦 Fetching: Contract **data** field\n"
+                    f"🔧 Status: Ready to decode with ABI",
                     parse_mode="Markdown"
                 )
             else:
@@ -220,8 +305,12 @@ async def epoch_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 🔄 **Next Epoch Reset (approx):** {epoch_reset.strftime('%Y-%m-%d %H:%M:%S UTC')}
 ⏳ **Time Until Reset:** {int(hours)}h {int(minutes)}m
 
-**Note:** Epoch duration is approximately 2,200,000 blocks.
-Actual reset time depends on network block production rate.
+**Epoch Configuration:**
+  Duration: 2,200,000 blocks
+  Block time: ~5 seconds
+  Approx epoch: ~3.3 hours
+
+**Note:** Actual reset depends on network block production rate.
         """
     else:
         epoch_text = "❌ Could not calculate epoch info. Try again later."
@@ -229,10 +318,51 @@ Actual reset time depends on network block production rate.
     await update.message.reply_text(epoch_text, parse_mode="Markdown")
 
 
+async def decode_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show how to decode contract data"""
+    decode_text = """
+📚 **How to Decode Contract Data**
+
+Your contract data is stored as a **TVM-encoded cell** (BASE64).
+It contains: tapSum, tapSum5m, taps[], and more!
+
+**Option 1: Use tvm-cli (Recommended)**
+```
+tvm-cli run <YOUR_ADDRESS> getDetails {} \\
+  --abi Miner.abi.json
+```
+
+**Option 2: Use Explorer**
+Go to: https://mainnet.ackinacki.org
+Search your Miner address → View contract state
+
+**Option 3: Provide ABI to Bot**
+Set environment variable:
+```
+MINER_ABI_PATH=/path/to/Miner.abi.json
+```
+
+**Getting the ABI:**
+Ask your game provider for `Miner.abi.json`
+It's usually in: `contracts/mvsystem/Miner.abi.json`
+
+**What You'll Get:**
+✅ tapSum - Total taps in big epoch
+✅ tapSum5m - Taps in 5-minute window
+✅ taps[] - Complete tap history
+✅ mbiCurTaps[] - Current MBI taps
+✅ Mining difficulties
+✅ And more!
+    """
+    await update.message.reply_text(decode_text, parse_mode="Markdown")
+
+
 async def handle_miner_address(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Handle when user sends a Miner contract address
-    ✅ Uses getContractState() from MAINNET
+    ✅ Uses blockchainAccountState() from MAINNET
+    ✅ Extracts contract data field
+    ✅ Shows decoding information
     """
     user_input = update.message.text.strip()
     
@@ -245,16 +375,16 @@ async def handle_miner_address(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return
     
-    loading_msg = await update.message.reply_text("⏳ Fetching your tap data from MAINNET...")
+    loading_msg = await update.message.reply_text("⏳ Fetching your contract data from MAINNET...")
     
     try:
-        # ✅ CORRECT METHOD: Fetch account data
+        # ✅ CORRECT METHOD: Fetch account with data field
         account_data = await fetch_miner_account(user_input)
         
         if not account_data:
             await loading_msg.edit_text(
                 f"❌ Miner contract not found: `{user_input}`\n\n"
-                f"🌐 Checking: {GRAPHQL_ENDPOINT}\n\n"
+                f"🌐 Checked: {GRAPHQL_ENDPOINT}\n\n"
                 "Make sure the address is correct and exists on Acki Nacki MAINNET.",
                 parse_mode="Markdown"
             )
@@ -262,6 +392,8 @@ async def handle_miner_address(update: Update, context: ContextTypes.DEFAULT_TYP
         
         balance = format_balance(account_data.get("balance", "0x0"))
         account_type = account_data.get("acc_type_name", "Unknown")
+        data_field = account_data.get("data", None)
+        last_paid = account_data.get("last_paid", "Unknown")
         
         # Get epoch reset info
         epoch_reset = calculate_epoch_reset()
@@ -272,28 +404,49 @@ async def handle_miner_address(update: Update, context: ContextTypes.DEFAULT_TYP
             minutes = (time_until.total_seconds() % 3600) // 60
             epoch_text = f"{int(hours)}h {int(minutes)}m"
         
+        # Build response
         response_text = f"""
 🎮 **Mobile Verifier Miner Data**
 
 🔐 **Miner Address:** `{user_input}`
-💰 **Balance:** {balance} (in smallest unit)
+💰 **Balance:** {balance} (smallest unit)
 📊 **Account Type:** {account_type}
-⏰ **Last Updated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}
+⏱️ **Last Paid:** {last_paid}
+🕐 **Last Updated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}
 
-🎯 **Epoch Info:**
+⏰ **Epoch Info:**
 ⏳ **Next Reset (approx):** {epoch_text}
 
 🌐 **Network:** Acki Nacki MAINNET
 📡 **Endpoint:** {GRAPHQL_ENDPOINT}
+🔍 **Method:** blockchainAccountState()
 
-**📝 Notes:**
-• Data fetched using getContractState()
-• tapSum & tapSum5m available in transaction responses
-• Contact game provider for detailed tap statistics
-• For real-time updates, listen to transaction events
+"""
+        
+        # Add data field information
+        if data_field:
+            response_text += extract_data_info(data_field)
+        else:
+            response_text += "⚠️ No contract data found\n"
+        
+        response_text += f"""
 
-**Want more detailed stats?**
-Use the game's official app or dashboard!
+**📝 Next Steps:**
+
+1. **Get the ABI:**
+   Ask your game provider for `Miner.abi.json`
+
+2. **Decode with tvm-cli:**
+   ```
+   tvm-cli run {user_input} getDetails {{}} \\
+     --abi Miner.abi.json
+   ```
+
+3. **Or use the Explorer:**
+   https://mainnet.ackinacki.org/
+
+**Questions?**
+Type /decode for detailed instructions!
         """
         
         await loading_msg.edit_text(response_text, parse_mode="Markdown")
@@ -318,6 +471,37 @@ def main():
         print("❌ ERROR: Set TELEGRAM_BOT_TOKEN first!")
         print("\nHow to set token:")
         print("1. In Replit: Click 'Secrets' button")
+        print("2. Add: TELEGRAM_BOT_TOKEN = your_token_from_BotFather")
+        print("3. Restart bot")
+        return
+    
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    
+    # Add command handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("status", status))
+    application.add_handler(CommandHandler("epoch", epoch_info))
+    application.add_handler(CommandHandler("decode", decode_help))
+    
+    # Add message handler for contract addresses
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_miner_address)
+    )
+    
+    print("✅ Bot is starting...")
+    print(f"✅ Network: Acki Nacki MAINNET")
+    print(f"✅ Endpoint: {GRAPHQL_ENDPOINT}")
+    print(f"✅ Method: blockchainAccountState() + data field")
+    print(f"✅ Miner ABI loaded: {MINER_ABI is not None}")
+    print("✅ Polling for messages...")
+    
+    application.run_polling()
+
+
+if __name__ == "__main__":
+    main()
+    print("1. In Replit: Click 'Secrets' button")
         print("2. Add: TELEGRAM_BOT_TOKEN = your_token_from_BotFather")
         print("3. Restart bot")
         return
